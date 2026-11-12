@@ -23,7 +23,7 @@ TASK_KEYS = (
     "TASK ID:",
     "ROUND:",
     "GOAL:",
-    "EXECUTOR:",
+    "EXECUTOR ROUTE:",
     "DEPENDS ON:",
     "INPUTS:",
     "PROJECT GUIDANCE:",
@@ -35,6 +35,7 @@ TASK_KEYS = (
     "VERIFY:",
     "DELIVER:",
     "STOP IF:",
+    "ROLE:",
 )
 REPORT_KEYS = ("TASK ID:", "ROUND:", "STATUS:", "CHANGED:", "CHECKS:", "SKILLS USED:", "ISSUES:")
 
@@ -105,9 +106,33 @@ def validate(root: Path = ROOT) -> list[str]:
     for word in ("ACCEPT", "REWORK", "REPLAN", "BLOCK", "D0", "L1", "L2", "L3"):
         if word not in skill:
             issues.append(f"Skill missing protocol marker: {word}")
-    for marker in ("VERIFIED_CHEAPER", "SAME_TIER", "UNVERIFIED", "UNAVAILABLE", "routing preflight"):
+    for marker in ("VERIFIED_CHEAPER", "PROVISIONAL_CHEAPER", "SAME_TIER", "UNVERIFIED", "UNAVAILABLE", "Automatic capability and routing setup"):
         if marker not in skill:
             issues.append(f"Skill missing worker-routing preflight marker: {marker}")
+    # Core behavioral contracts: cheap workers must be configured when allowed,
+    # not merely discovered. This is static checking, not runtime enforcement.
+    for marker in (
+        "Per-dispatch route", "Session-scoped route", "Project/user configuration",
+        "Verify the effective route", "Do not merely check", "head model",
+        "No recursive orchestration", "No worker spawn", "project skills",
+        "head checkpoint", "total expected", "REWORK", "STOP IF:",
+    ):
+        if marker.lower() not in skill.lower():
+            issues.append(f"Skill missing orchestration contract: {marker}")
+    for phrase in ("explicitly authorized", "restart", "permissions"):
+        if phrase.lower() not in skill.lower():
+            issues.append(f"Skill missing safe auto-configuration condition: {phrase}")
+    for filename in (
+        "skills/lean-orchestrator/SKILL.md",
+        "skills/lean-orchestrator/references/setup-preflight.md",
+        "skills/lean-orchestrator/references/worker-packet.md",
+        "skills/lean-orchestrator/references/feedback-loop.md",
+    ):
+        content = (root / filename).read_text(encoding="utf-8") if (root / filename).is_file() else ""
+        # Vendor-neutral core behavior; optional installer tooling in README is different.
+        for vendor in ("codex", "claude", "kimi", "anthropic", "openai", "gemini"):
+            if re.search(r"\b" + re.escape(vendor) + r"\b", content, re.IGNORECASE):
+                issues.append(f"Vendor-specific reference in {filename}: {vendor}")
     # These references must work after a skill-only installation.
     for relative in ("references/worker-packet.md", "references/feedback-loop.md", "references/setup-preflight.md"):
         if not (skill_file.parent / relative).is_file():
