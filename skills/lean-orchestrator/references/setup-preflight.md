@@ -1,62 +1,63 @@
-# Automatic worker discovery, configuration, and routing preflight
+<!-- lean-orchestrator-release: 1.7.0 -->
+# Routing setup
 
-**Goal:** Make the root head agent automatically find or establish the cheapest viable worker route, where the running host allows it. The user should not have to preconfigure worker models just to benefit from this skill. This checklist describes an agent behavior, not a universal configuration API.
+Read once before substantial delegation, then revisit only if capabilities change or a routing problem appears. This procedure is generic; the running host's tool contracts supply the concrete commands and model IDs.
 
-## Observe before spending quota
+<a id="discover"></a>
+## Discover without expensive probing
 
-1. Inspect available spawn, messaging, resume, model/effort-selection, worker-definition, permission, and isolation capabilities from the host's advertised tools and accessible local configuration. Check project-level guidance and permissions.
-2. Identify the effective head model if exposed, available worker models, allowed reasoning efforts, relative price/quota signals (if reported), and whether worker calls inherit head settings. Avoid probing multiple paid model calls solely to identify availability.
-3. Determine which configuration levels exist: **per-spawn**, **session temporary**, **project persistent**, **user/global persistent**, or **none**. Prefer the first two for safety and to avoid unintended future costs.
-4. Determine if workers can access mandatory project rules and relevant skills, and if worker delegation can be disabled at the host level. Do not assume the worker's context matches the head's.
+Use advertised tools, authorized local configuration, help/schema, and existing worker definitions. Inspect only relevant configuration; do not dump credentials or scan an entire account. If local information is insufficient, consult official host documentation when accessible, matching the installed version rather than assuming the newest syntax applies.
 
-## Set up automatically in preference order
+Establish:
 
-| Priority | Capability | Head action |
-| --- | --- | --- |
-| 1 | Per-call worker model/effort selection | Specify the lowest capable model/effort on each worker spawn; avoid altering persistent settings |
-| 2 | Temporary worker/session configuration | Create or select a session-scoped cheap worker role and use it for appropriate tasks |
-| 3 | Persistent configuration edits | Only if the user/project explicitly authorizes them and host policy allows; make minimal reversible changes, preserve settings, and handle restart requirements |
-| 4 | No supported way to select cheaper workers | Use D0/direct head execution, or delegate only for non-cost benefits; mention limitations once |
+- Worker creation, model/effort selection, role permissions, cancellation, wait/resume, concurrency, and result retrieval capabilities.
+- Eligible model choices and required tool, context, modality, and skill capabilities. Include only routes authorized for this project's data and budget.
+- Effective head/worker models when exposed; inheritance and precedence of per-call, role, session, and persistent settings. A role may override a default or add a costly prompt.
+- Whether contexts/files are shared or isolated; how artifacts, project instructions, and skills reach workers.
+- Available cost evidence for the user's actual metric. Distinguish cached-input/output charges, tool costs, quota weights, and opaque subscription accounting. Use only information available, not guessed prices.
 
-**Do not confuse discovery with setup.** Discovering that a cheap model *could* exist does not configure it. Attempt safe automatic selection/creation before concluding that no cheap route is configured. Never hardcode model names, config file paths, provider-specific commands, prices, or defaults into the skill.
+One bounded inspection pass should normally suffice. Investigate further only for a concrete unresolved blocker; prefer useful work over repeated configuration experiments. Cache findings with environment, relevant configuration, permission scope, and model availability. Availability in a general catalog does not prove account access.
 
-**Never change the head model on the user's behalf** or modify credentials, global preferences, or a different project's settings simply to create a worker. Do not use unrelated shell commands or undocumented controls to bypass permission restrictions. If the environment requires an explicit approval, request it only if the change is necessary; otherwise work with the existing environment.
+<a id="configure"></a>
+## Select or configure, in order
 
-## Verify the outcome
+1. **Per-dispatch selection.** Reuse a suitable existing role or pass an allowed model/effort explicitly. Confirm how role settings interact with overrides. A role called "cheap" does not establish model identity or cost.
+2. **Session-scoped setup.** Create the smallest permitted temporary role/override when per-call routing is unavailable. Keep the head model unchanged. Apply least-privilege worker tools and no worker delegation where supported.
+3. **Persistent setup, only with authorization.** Project or user settings require explicit user authorization or established project policy covering that change, plus host permission. File-write access alone is not authorization. Invocation of this skill is not blanket approval to modify account/global defaults. Prefer project scope to global scope, preserve unrelated fields, validate syntax, and record just the values changed. If reload/restart is required, mark the change pending; do not terminate the head session or claim the route is active. Ask for necessary approval rather than repeatedly trying blocked changes.
+4. **Fallback.** Use the best authorized route or execute directly. Explain a material limitation once, without making the user repeatedly reconfigure a host that offers no controls.
 
-- Check the actual model/effort parameters submitted to the spawn tool or host-confirmed effective worker routing. Where supported, inspect effective worker metadata after spawn.
-- Distinguish **requested model** from **effective model**. A role name, text instruction, config comment, or a worker's own statement does not prove which model ran.
-- If the host requires a reload/restart to apply new configuration, do not report the change as effective before it takes effect.
-- Classify and retain routing evidence once per environment, refreshing it only when changed:
+Do not enroll a new provider/account, transmit project data to an unapproved destination, enable paid overages, install a new runtime, or bypass a sandbox to obtain a cheaper model. A documented local command can be a valid routing mechanism only if already available and authorized; shell access does not create permission to evade a restriction.
 
-| Status | Evidence and action |
+Track temporary changes/resources you create. Revert only your own changed fields if their current values still match your changes. Do not overwrite later user edits or remove roles that other work is using. Leave explicitly authorized persistent changes intact unless their agreed lifetime was temporary.
+
+<a id="evidence"></a>
+## Separate routing evidence from cost evidence
+
+| Routing state | Meaning |
 | --- | --- |
-| `VERIFIED_CHEAPER` | Route and actual cost/quota advantage supported by reliable evidence; delegate if total expected cost justifies it |
-| `PROVISIONAL_CHEAPER` | Lower-tier model route can be selected, but price or quota impact is unknown; delegate bounded low-risk tasks cautiously, with no savings claim |
-| `SAME_TIER` | Worker is known to inherit or use the head's cost tier; prefer D0/head unless another benefit offsets overhead |
-| `UNVERIFIED` | Effective worker route cannot be established; do not delegate solely for savings |
-| `UNAVAILABLE` | No usable worker spawn; execute directly |
+| `CONFIRMED` | Authoritative host execution metadata or documented effective-routing output identifies the route actually applied. |
+| `REQUESTED_ONLY` | A supported request/configuration selects a route, but actual execution has not been confirmed. Submitted arguments alone belong here. |
+| `UNKNOWN` | Effective routing cannot be established, or observed execution contradicts the requested route without a resolved explanation. |
+| `UNAVAILABLE` | No permitted usable delegation mechanism exists. |
 
-Use only evidence actually exposed by the host. Subscription quota, token count, API price, and time are **different metrics**; they may not track each other. Prefer total expected successful-task usage to a single-call estimate, including startup, context, retries, and head reviews.
+Independently record `metric`, `relative_unit_cost = LOWER | SAME | HIGHER | UNKNOWN`, the evidence source, and any uncertainty. These labels are head bookkeeping, not literal API parameters. A worker's self-identification, role name, or a config file not yet loaded is not runtime proof. Never promote `REQUESTED_ONLY` merely because the worker says the chosen model ran.
 
-## Route-selection checklist for each work packet
+A `LOWER` API price says nothing certain about a subscription's quota weights. Even a confirmed lower unit cost does not establish a lower total task cost: head context, worker context, tool charges, failures, and integration still matter.
 
-1. Can D0 complete the work safely and deterministically?
-2. Is direct head execution cheaper than composing, spawning, reviewing, and possibly correcting a worker?
-3. If delegating, what is the smallest capable executor? Has the head already specified all essential design decisions?
-4. Can the host route to it *now*? If not, can the head establish a session-scoped route without approval?
-5. Can the worker receive the applicable project rules/skills and be prevented from nested delegation?
-6. Is task verification cheap and objective? Is risk of retry lower than choosing the next capable tier?
-7. Is parallelism genuinely useful, or will it create merge conflicts and extra head reviews?
+For an unconfirmed but supported route, make a bounded first assignment do useful work; inspect returned host metadata before scaling up. When confirmation is impossible, keep the uncertainty explicit and decide using the available evidence. Do not ban all delegation because a host hides pricing; do not describe it as verified savings either.
 
-Keep preflight checks lightweight; do not repeat them in every worker prompt. If the host supports neither configuration nor cheaper routing, a **truthful fallback is correct behavior**, not a failure of the skill.
+<a id="fallback"></a>
+## Decide without overclaiming
 
-## Reporting routing limitations
+| Situation | Action |
+| --- | --- |
+| Economical capable route is usable | Select it automatically; dispatch only if whole-task economics justify it. |
+| Route requested but execution opaque | Small useful assignment with a finite budget; do not assume savings or fan out broadly. |
+| Requested cheap route resolves to the head/other model | Record the effective evidence, stop expanding that route, and diagnose precedence once or use a fallback. |
+| Same-model worker has much smaller relevant context | Consider the actual estimated total, including review; smaller context can justify delegation without a different model. |
+| Only known higher-cost workers are available | Use only for a necessary capability/quality or explicit latency benefit; otherwise direct/D0. |
+| Required project skills or tools cannot reach worker | Transfer authorized requirements safely, choose a capable route, or retain the task at the head. |
+| Configuration blocked or requires restart | Do not claim it succeeded; continue with current capabilities or request only a necessary approval. |
+| No eligible worker | Complete useful work directly and state material limits. |
 
-When relevant, state one concise fact, not repeated warnings:
-
-- "I selected a cheaper worker model for this task; its quota impact is not exposed by the host."
-- "This environment currently routes workers at the same tier as the head and provides no permitted override, so I am using direct execution for cost-sensitive steps."
-- "The host requires approval or a restart before a persistent worker configuration change can take effect. I am continuing with the available route."
-
-Do not claim an automatic configuration change occurred unless it actually did.
+A concise routing disclosure is enough when relevant: "Worker model selected through the host; actual subscription quota impact is not exposed." Never report a precise quota percentage from an API-price proxy.

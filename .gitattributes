@@ -1,2 +1,6 @@
-# Auto detect text files and perform LF normalization
+# Normalize repository text; consistent across Windows and Unix checkouts.
 * text=auto
+*.md text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+LICENSE text eol=lf

@@ -1,100 +1,83 @@
+<!-- lean-orchestrator-release: 1.7.0 -->
 # Lean Orchestrator
 
-**A provider-independent Agent Skill that plans complex tasks, configures economical workers when permitted, and coordinates their results.**
+**A model-agnostic Agent Skill for precise delegation, economical workers, and accountable head-agent review.**
 
-Lean Orchestrator turns an agent into a **head agent**: it makes the architectural decisions, decomposes the request into precise assignments, selects or configures suitable lower-cost workers, passes along relevant project skills, verifies results, and corrects failures before integrating the completed work.
+Lean Orchestrator makes the main agent responsible for understanding your task, making design decisions, and giving workers clear implementation instructions. It discovers the host's capabilities and automatically selects or configures lower-cost capable workers where permitted. The head reviews their output, sends focused corrections, and integrates the result.
 
-Its goal is to **minimize total expected model usage without compromising correctness**. If direct execution is cheaper or worker routing is unavailable, the head avoids unnecessary delegation.
+The objective is lower **total** usage, including head planning, worker context, retries, and verification. A small task may be better completed directly. No particular model, provider, or worker framework is required by the instructions.
 
 ## Install
 
-With the [Skills CLI](https://github.com/vercel-labs/skills):
+Using the [Skills CLI](https://github.com/vercel-labs/skills) with its supported Node.js version (currently 22.20 or later):
 
 ```bash
 npx skills add Tsinwntas/lean-orchestrator --skill lean-orchestrator
 ```
 
-To make it available across projects:
+For availability across projects:
 
 ```bash
 npx skills add Tsinwntas/lean-orchestrator --skill lean-orchestrator -g
 ```
 
-Alternatively, copy the entire [`skills/lean-orchestrator/`](skills/lean-orchestrator/) directory, including `references/`, into your agent's supported skills directory. Any agent that can read skill instructions can use the planning protocol; execution features depend on the tools that agent actually has.
+For manual installation, copy the complete [`skills/lean-orchestrator/`](skills/lean-orchestrator/) directory into your host's supported skills location. Include its `references/` directory and `LICENSE`, not just `SKILL.md`. The repository's Python checks and GitHub workflow are not runtime requirements.
 
 ## Use
 
-Activate `lean-orchestrator` through your agent's skill interface, or say:
+Activate the skill in your agent, or ask:
 
 ```text
-Use Lean Orchestrator for this task. Plan the work yourself, automatically
-select or configure the lowest-cost capable workers if permitted, give
-workers exact instructions and relevant project skills, review their work,
-and deliver the verified result.
+Use Lean Orchestrator for this task. Make the design decisions yourself,
+automatically select or configure economical capable workers where permitted,
+give them precise instructions and the relevant project skills, review and
+correct their results, and deliver the integrated outcome.
 ```
-
-## How it works
 
 ```text
-User request
-     |
-     v
-HEAD: understand request + discover project skills
-     |
-     v
-HEAD: discover available models and worker-routing controls
-     |-- select cheaper worker per call, if supported
-     |-- otherwise configure a temporary worker route, if supported
-     |-- otherwise use permitted existing tools / direct execution
-     v
-HEAD: design solution and define A0, A1, ...
-     |
-     +--> A0: exact task packet --> WORKER --> evidence
-     |                                 |
-     +<--------- HEAD verifies and ACCEPTS A0
-     |
-     +--> A1: dependent task ---> WORKER --> evidence
-     |                                 |
-     +<--------- HEAD detects issue and requests correction
-     |
-     +--> A1 round 2 ---------> WORKER --> fixed evidence
-     |                                 |
-     +<--------- HEAD verifies and ACCEPTS A1
-     |
-     v
-HEAD: run integration checks and deliver result
+User task
+  -> Head: settle requirements, inspect project skills, establish worker routing
+  -> A0: exact assignment -> worker result -> head verification and acceptance
+  -> A1: dependent assignment -> worker result -> head requests a correction
+  -> A1, next round -> corrected result -> head verification and acceptance
+  -> Head: integrated checks and delivery
 ```
 
-Independent, nonconflicting tasks may run in parallel. Dependent work waits for head acceptance.
+Independent work can run in parallel when its resources and outputs do not conflict. Dependent work waits for accepted inputs that are actually available to its worker.
 
-## What it does
+## What the skill controls
 
-- **Automatic worker routing:** discovers host-supported models and agent tools, chooses economical routes, and configures temporary workers when permitted—without requiring a preconfigured cheap worker.
-- **Head-first reasoning:** centralizes architecture, requirements, interfaces, dependencies, and test design to avoid making cheap workers guess.
-- **Precise task packets:** gives workers exact scope, steps, required project guidance, implementation skills, acceptance checks, and stop conditions.
-- **Closed-loop orchestration:** receives reports, reviews artifacts, issues targeted corrections, and escalates only when necessary.
-- **Project-skill continuity:** ensures workers can use applicable project instructions and skills even when worker contexts are isolated.
-- **No recursive delegation:** worker packets prohibit spawning further agents; host-enforced restrictions are used when available.
-- **Whole-run efficiency:** considers head reasoning, worker setup, context, reviews, and retries; uses deterministic tools or direct execution when cheaper.
-- **Graceful fallback:** continues productively when models cannot be switched, workers cannot be spawned, or capabilities cannot be verified.
+| Responsibility | Behavior |
+| --- | --- |
+| Planning | The head settles architecture, interfaces, edge cases, and acceptance criteria. |
+| Routing | Uses supported per-call controls or temporary setup; persistent settings require authorization. |
+| Worker instructions | Supplies bounded scope, procedures, relevant skills, finite limits, and verification. |
+| Review | Checks actual artifacts rather than trusting a worker's completion claim. |
+| Recovery | Handles corrections, stale results, timeouts, partial writes, and exhausted retry budgets. |
+| Efficiency | Avoids unnecessary agents, duplicated context, repeated polling, and excessive head reviews. |
+| Role separation | Workers use implementation skills without gaining authority to spawn further agents. |
 
-## Requirements and limitations
+## Compatibility and limits
 
-Lean Orchestrator is a **skill, not a separate model router or agent runtime**. Actual worker spawning, model selection, temporary configuration, skill access, and messaging depend on what the running environment exposes. The skill never bypasses host permissions or silently changes persistent user settings. When a cheaper worker route cannot be verified, it must not claim verified quota savings.
+This is an **instruction skill, not a model router or agent runtime**. A model can follow the planning protocol only to the extent its host exposes the required tools. The skill cannot create missing subagent APIs, force hidden model selection, override permissions, or guarantee lower quota use. It preserves the user-selected head model and falls back to direct execution when that is the sensible available path.
 
-The installable entry point is [`skills/lean-orchestrator/SKILL.md`](skills/lean-orchestrator/SKILL.md). Its reference files install alongside it; repository CI and test files are not required at runtime.
+Requested routing is distinguished from confirmed execution. Model prices, token counts, and subscription quotas are different measurements. The skill does not present an assumed cheaper route as verified whole-task savings.
 
-Cost savings and compatibility across agent hosts have **not yet been formally benchmarked**.
+Workers need access to their required project instructions and implementation skills. Where supported, host permissions restrict delegation and other unnecessary tools; written prohibitions alone are not a security boundary. Installing the skill does not authorize new billing, new data destinations, or changes to global settings.
 
-## Offline validation
+The [core instructions](skills/lean-orchestrator/SKILL.md) and bundled references are provider-independent and can be adapted to your own workflow. Actual behavior depends on the host and the model following the instructions.
+
+## Offline checks
+
+With Python 3.11 or later, from the repository root:
 
 ```bash
-python3 scripts/validate.py
-python3 -m unittest discover -s tests -v
+python scripts/validate.py
+python -m unittest discover -s tests -v
 ```
 
-These dependency-free checks validate metadata and required instruction contracts. They do **not** simulate live sub-agent calls or measure model costs.
+These standard-library checks inspect metadata, portable links, packet contracts, release consistency, and malformed-input regressions. They make no LLM calls and do not prove live model behavior or cost savings.
 
 ## License
 
-[MIT](LICENSE) — free to use, modify, and redistribute under the license terms.
+[MIT](LICENSE) — use, modify, and redistribute under its terms.

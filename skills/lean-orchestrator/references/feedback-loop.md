@@ -1,41 +1,83 @@
-# Worked loop: auto-routing, dependent tasks, and targeted rework
+<!-- lean-orchestrator-release: 1.7.0 -->
+# Feedback, acceptance, and recovery
 
-**User:** Add an account-settings endpoint and tests, omitting secrets and handling a missing account.
+<a id="states"></a>
+## Head-owned states
 
-The root head first checks whether the host permits a lower-cost worker route. It selects a cheaper worker directly if available, otherwise establishes a permitted temporary worker route, verifies the effective route when possible, or falls back honestly. **The user is not expected to preconfigure worker models.** The head also identifies required project skills and passes them into each worker's context.
+| State | Meaning / exit condition |
+| --- | --- |
+| `PLANNED` | Scope, dependencies, and checks are being settled. |
+| `READY` | Inputs are current, prerequisites accepted and available, route/budget selected. |
+| `RUNNING` | One identified worker/round owns the assigned write scope. |
+| `REVIEW` | Result collected; no acceptance implied by `DONE`. |
+| `REWORK` | Head prescribed a localized correction within remaining budget. |
+| `ACCEPTED` | Head verified the contract against current, integrated/accessible artifacts. |
+| `STALE` | Relevant prerequisite/input changed; recheck or replan before reuse. |
+| `BLOCKED` | Missing permission, input, safe execution path, or required verification. |
+| `FAILED` | Attempt failed; diagnose and replan/direct-execute or report the gap. |
+| `CANCELLED` | Stop confirmed or workspace isolated from any still-running attempt. |
 
-| Step | Interaction | Head decision |
-| --- | --- | --- |
-| 0 | Head inspects tools/model routing, skills, and requirements | Auto-select/configure cheaper worker if permitted; settle API contract |
-| 1 | Head → Worker 0: `A0` endpoint implementation with fixed response contract | DISPATCH; allow only specified source file |
-| 2 | Worker 0 → Head: `A0 DONE` with changed file and observed check | Head independently inspects diff and ACCEPTS A0 |
-| 3 | Head → Worker 1: `A1` tests for present and missing account | DISPATCH only after A0 is accepted |
-| 4 | Worker 1 → Head: `A1 DONE`, tests green | Head notices missing secret-redaction assertion; REWORK |
-| 5 | Head → Worker 1: `A1 ROUND 2`, precise missing assertion | Resume if economical, otherwise send bounded correction to new worker |
-| 6 | Worker 1 → Head: `A1 ROUND 2 DONE` with new assertion | Head verifies and ACCEPTS A1 |
-| 7 | Head / D0: `A2` affected tests and integration check | ACCEPT or repair |
-| 8 | Head → User: deliver finished files and actual verification | Report route as verified, provisional, or unavailable |
+`REPLAN` is a head decision: change the plan, invalidate affected descendants, preserve useful verified artifacts, and return appropriate tasks to `PLANNED`. `BLOCK` is a decision that sets `BLOCKED`. Never mark a task cancelled just because a cancellation request was sent. Keep an uncertain still-running worker visible in the ledger and protect its write scope.
 
-Example correction:
+<a id="example"></a>
+## A0 → A1 → correction
 
+Illustrative task: prepare a simple dataset and a short summary. The head chooses an authorized economical route, specifies the output contract, and assigns a bounded transformation. Worker routing is selected through host controls, not through this text.
+
+<!-- packet: example-task -->
 ```text
-ROLE: WORKER (NEVER HEAD)
-TASK ID: A1
-ROUND: 2
-PRIOR RESULT: Test code did not assert API_TOKEN is omitted from the JSON response.
-GOAL: Add the missing assertion to the existing-account test.
-WRITE SCOPE: tests/test_settings.py only
+ROLE: WORKER
+TASK ID: A0
+ROUND: 1
+GOAL: Write normalized.csv with columns name,score, preserving row order.
+DEPENDS ON: NONE
+BASE: The literal source below is the complete immutable input for this assignment.
+WORKSPACE: The isolated work directory provided by the host for A0.
+READ SCOPE: Literal CSV: name,score / " Ada ",3 / "Ben",4. Slashes separate lines.
+WRITE SCOPE: normalized.csv only.
+GUIDANCE: No additional project rules apply to this isolated example.
+SKILLS: NONE
 PROCEDURE:
-  1. Reuse the existing response object.
-  2. Assert API_TOKEN is absent from the serialized response.
-  3. Run: python -m pytest tests/test_settings.py -q
-CONSTRAINTS: No endpoint edits or refactoring. No subdelegation.
-VERIFY: Focused test passes; diff contains the assertion.
-STOP IF: Fixture cannot expose the value being checked; report the blocker.
+  1. Parse the supplied two-row CSV; trim leading/trailing spaces from names.
+  2. Write a header and two rows to normalized.csv; preserve integer scores/order.
+CONSTRAINTS:
+  No delegation, redesign, unrelated writes, network access, or external actions.
+LIMITS: At most 4 tool calls and 1 local repair; report within 120 words.
+VERIFY: Header name,score; rows Ada,3 then Ben,4; exactly two data rows.
+DELIVER: normalized.csv in this workspace and a concise report.
+STOP IF: Input interpretation is ambiguous, writing is unavailable, or limits are reached.
 ```
 
-**No unnecessary head wake-ups:** The head can group routine independent checks into one meaningful review checkpoint, but it cannot release dependent work without accepting prerequisites. The goal is low total head+worker usage, not maximizing the number of worker reports.
+The head inspects the actual CSV, confirms the values and row count with a deterministic check, and transfers it to the next worker's workspace if required. Only then does the head accept A0. A1 receives a complete packet to write a summary with **row count and total score**, using this accepted snapshot; its verification requires both 2 and 7. Suppose the worker omits the total despite reporting `DONE`.
 
-**Parallelism:** An independent read-only documentation audit can run alongside A0. Tasks sharing writable files need serialization or isolated integration.
+| Interaction | Decision |
+| --- | --- |
+| Worker A0 returns the normalized data | Head checks and accepts A0. |
+| Head dispatches A1 with accepted data and explicit summary requirements | A1 runs only after prerequisites are available. |
+| Worker A1 reports `DONE`; summary omits total score | Head chooses `REWORK`, not acceptance based on status. |
+| Head sends A1 round 2 with exact missing requirement and current base | Reuse the session only if context and route remain suitable. |
+| Worker returns corrected summary | Head verifies row count 2 and total 7, then accepts A1. |
+| Head checks both final files against the user's request | Deliver artifacts and actual verification. |
 
-**No resumable workers:** Treat `A1 ROUND 2` as a new worker call carrying the minimal context. Synchronous tool returns count as worker reports; do not assume persistent messaging or background work.
+The numbers are from this example's literal data, not measured model-performance results. An ordinary D0 tool could complete this tiny task more cheaply; the example illustrates communication, **not a recommendation to delegate trivial work**. In real use, choose packets large enough to justify coordination.
+
+<a id="edge-cases"></a>
+## Recovery decisions
+
+| Event | Required head action |
+| --- | --- |
+| Host offers cheap per-call routing but no worker role exists | Select the permitted route directly; do not ask the user to create a role first. |
+| Host confirms a model but exposes only API price, not quota | Keep route confidence and quota-cost uncertainty separate. |
+| Worker sees Lean Orchestrator in its skill catalog | It remains a worker; skill visibility grants no delegation authority. |
+| Mandatory implementation skill is absent | Provide authorized complete requirements or move work to a capable route/head. |
+| Tests pass but artifacts violate the contract | Reject/rework; tests are evidence, not the definition of success. |
+| Worker alters acceptance tests to hide a failure | Reject, preserve evidence, restore only its unauthorized changes safely, replan. |
+| Old round completes after a newer result | Quarantine the stale result; do not overwrite accepted work. |
+| Worker times out and cancellation is unconfirmed | Do not hand its write scope to another worker; isolate or block. |
+| A0's accepted output changes while A1 is running | Stop affected work where possible; mark A1 stale and revalidate its inputs/results. |
+| Repeated failure exhausts the finite budget | Diagnose/replan or take over; do not reset attempt counts through renamed tasks. |
+| Head resumes after context loss | Reconcile worker handles, input versions, partial writes, and accepted artifacts before dispatch. |
+| Required check cannot run | Record unverified status; use a justified alternative or block acceptance. |
+| User changes goal or cancels | Stop obsolete work, preserve user edits, account for active workers and partial artifacts. |
+
+For independent work, gather concise reports and checks at a single review checkpoint when economical. Do not repeatedly wake the head to ask whether a worker is finished. If the host is synchronous, a normal tool return is the report; if it cannot resume a worker, send a new complete correction assignment. Never invent an asynchronous messaging system.

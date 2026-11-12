@@ -1,143 +1,370 @@
-"""Offline structural checks; these do not run or price LLM agents."""
+"""Offline parser, packaging, and contract regressions; no LLM calls.
+
+Negative tests deliberately damage copies of the package. These establish what
+the validator catches, not whether a live agent will obey the instructions.
+"""
 from __future__ import annotations
 
 import importlib.util
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location("skill_validate", ROOT / "scripts" / "validate.py")
+spec = importlib.util.spec_from_file_location("lean_validate", ROOT / "scripts/validate.py")
 assert spec and spec.loader
-validate_module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(validate_module)
-
-SKILL_DIR = ROOT / "skills" / "lean-orchestrator"
+validator = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(validator)
+SKILL_DIR = ROOT / "skills/lean-orchestrator"
 SKILL = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
-PREFLIGHT = (SKILL_DIR / "references" / "setup-preflight.md").read_text(encoding="utf-8")
-PACKET = (SKILL_DIR / "references" / "worker-packet.md").read_text(encoding="utf-8")
-LOOP = (SKILL_DIR / "references" / "feedback-loop.md").read_text(encoding="utf-8")
+PACKET = (SKILL_DIR / "references/worker-packet.md").read_text(encoding="utf-8")
+LOOP = (SKILL_DIR / "references/feedback-loop.md").read_text(encoding="utf-8")
+EXAMPLE = validator.marked_packet(LOOP, "example-task")
+VERSION = validator.parse_frontmatter(SKILL)["metadata"]["version"]
 README = (ROOT / "README.md").read_text(encoding="utf-8")
+INSTALL_SOURCE = re.search(r"npx skills add ([^ ]+) --skill", README).group(1)
+OTHER_SOURCE = "test-fork/lean-orchestrator" if INSTALL_SOURCE != "test-fork/lean-orchestrator" else "another-fork/lean-orchestrator"
 
 
-class SkillContractTests(unittest.TestCase):
-    def test_metadata(self):
-        metadata = validate_module.parse_frontmatter(SKILL)
-        self.assertEqual(metadata["name"], "lean-orchestrator")
-        self.assertEqual(metadata["license"], "MIT")
-        self.assertEqual(metadata["metadata"], "")
-        self.assertLessEqual(len(metadata["description"]), 1024)
-        self.assertIn('version: "1.6.0"', SKILL)
+class FrontmatterTests(unittest.TestCase):
+    def test_actual_metadata_is_parsed_as_strings_and_mapping(self):
+        meta = validator.parse_frontmatter(SKILL)
+        self.assertEqual(meta["name"], "lean-orchestrator")
+        self.assertEqual(meta["metadata"]["protocol"], "2")
+        self.assertRegex(meta["metadata"]["version"], r"^\d+\.\d+\.\d+$")
+        self.assertEqual(validator.CONTRACT_VERSION, "2")
 
-    def test_validation_passes(self):
-        self.assertEqual(validate_module.validate(), [])
+    def test_missing_opening_delimiter_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "opening"):
+            validator.parse_frontmatter("name: example\n---\n")
 
-    def test_duplicate_metadata_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Duplicate"):
-            validate_module.parse_frontmatter("---\nname: test\nname: another\n---\nbody")
-
-    def test_missing_yaml_delimiter_rejected(self):
+    def test_missing_closing_delimiter_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "closing"):
-            validate_module.parse_frontmatter("---\nname: test\n")
+            validator.parse_frontmatter("---\nname: example\n")
 
-    def test_self_setup_before_cost_delegation(self):
-        self.assertIn("**Self-route before delegating.**", SKILL)
-        self.assertIn("Do not merely check whether an existing cheap worker", SKILL)
-        self.assertIn("This step is mandatory before cost-driven delegation", SKILL)
-        self.assertIn("The user should not have to preconfigure worker models", PREFLIGHT)
+    def test_duplicate_root_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            validator.parse_frontmatter("---\nname: a\nname: b\n---\n")
 
-    def test_all_setup_modes_explored_in_preferred_order(self):
-        routes = ("Per-dispatch route", "Session-scoped route", "Project/user configuration", "No permitted configuration path")
-        positions = [SKILL.index(r) for r in routes]
-        self.assertEqual(positions, sorted(positions))
-        self.assertIn("per-spawn", PREFLIGHT.lower())
-        self.assertIn("temporary", PREFLIGHT)
+    def test_duplicate_nested_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            validator.parse_frontmatter('---\nmetadata:\n  version: "1.0.0"\n  version: "2.0.0"\n---\n')
 
-    def test_persistent_config_changes_require_permission(self):
-        self.assertIn("only if explicitly authorized", SKILL)
-        self.assertIn("minimal reversible changes", SKILL)
-        self.assertIn("Never change the head model", PREFLIGHT)
-        self.assertIn("reload/restart", PREFLIGHT)
+    def test_invalid_indentation_is_not_silently_ignored(self):
+        for line in (' version: "1"', '   version: "1"', '\tversion: "1"'):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                validator.parse_frontmatter(f"---\nmetadata:\n{line}\n---\n")
 
-    def test_route_verification_and_honest_cost_accounting(self):
-        for status in ("VERIFIED_CHEAPER", "PROVISIONAL_CHEAPER", "SAME_TIER", "UNVERIFIED", "UNAVAILABLE"):
-            self.assertIn(status, SKILL)
-            self.assertIn(status, PREFLIGHT)
-        self.assertIn("Verify the effective route", SKILL)
-        self.assertIn("effective worker metadata", PREFLIGHT)
-        self.assertIn("Do not invent saved tokens", SKILL)
+    def test_nested_key_without_parent_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "outside metadata"):
+            validator.parse_frontmatter('---\nname: a\n  version: "1.0.0"\n---\n')
 
-    def test_worker_skills_and_project_guidance(self):
-        for marker in ("PROJECT GUIDANCE:", "REQUIRED SKILLS:", "OPTIONAL SKILLS:", "SKILLS USED:"):
-            self.assertIn(marker, SKILL)
-            self.assertIn(marker, PACKET)
-        self.assertIn("Never assume head-loaded skills are inherited", SKILL)
-        self.assertIn("preload", SKILL)
+    def test_unknown_top_level_key_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown"):
+            validator.parse_frontmatter("---\nnamme: example\n---\n")
 
-    def test_no_recursive_orchestration(self):
-        self.assertIn("No recursive orchestration", SKILL)
-        self.assertIn("ROLE: WORKER (never HEAD)", SKILL)
-        self.assertIn("No recursive delegation", PACKET)
-        self.assertIn("Remove delegation tools", SKILL)
+    def test_unbalanced_quotes_are_rejected(self):
+        for value in ('"broken', "'broken", 'broken"', "'one' two'"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validator.parse_frontmatter(f"---\nname: {value}\n---\n")
 
-    def test_dependency_review_and_correction(self):
-        self.assertIn("ACCEPT", SKILL)
-        self.assertIn("REWORK", SKILL)
-        self.assertIn("REPLAN", SKILL)
-        self.assertIn("BLOCK", SKILL)
-        self.assertIn("A1 ROUND 2", LOOP)
-        self.assertIn("DISPATCH only after A0 is accepted", LOOP)
-        self.assertIn("DEPENDENCIES", SKILL.upper())
+    def test_nonstring_yaml_values_are_rejected(self):
+        for value in ('false', 'null', 'yes', '123', '1.2', '0x10', '1e3', '2026-11-12', '[a,b]', '{x: y}', '|'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validator.parse_frontmatter(f"---\nname: {value}\n---\n")
 
-    def test_head_usage_optimized_without_bypassing_review(self):
-        self.assertIn("head checkpoint", SKILL)
-        self.assertIn("never release dependencies until the head approves", SKILL)
-        self.assertIn("total expected usage", SKILL)
-        self.assertIn("No unnecessary head wake-ups", LOOP)
+    def test_quoted_strings_preserve_contents(self):
+        meta = validator.parse_frontmatter('---\nname: "example"\ndescription: \'It\'\'s a test\'\n---\n')
+        self.assertEqual(meta["description"], "It's a test")
 
-    def test_workers_are_bounded(self):
-        for field in validate_module.TASK_KEYS:
-            self.assertIn(field, PACKET)
-        for field in validate_module.REPORT_KEYS:
-            self.assertIn(field, PACKET)
-        self.assertIn("No irreversible external action", PACKET)
-        self.assertIn("No redesign", PACKET)
+    def test_crlf_is_supported(self):
+        self.assertEqual(validator.parse_frontmatter(SKILL.replace("\n", "\r\n")), validator.parse_frontmatter(SKILL))
 
-    def test_retry_and_fallback(self):
-        self.assertIn("Do not retry an unchanged failing packet", SKILL)
-        self.assertIn("No worker spawn or no cheaper routing", SKILL)
-        self.assertIn("No worker resume/messaging", SKILL)
-        self.assertIn("Model switch needs approval/restart", SKILL)
+    def test_bom_is_rejected_with_clear_error(self):
+        with self.assertRaisesRegex(ValueError, "BOM"):
+            validator.parse_frontmatter("\ufeff" + SKILL)
 
-    def test_installable_skill_is_self_contained(self):
-        self.assertTrue((SKILL_DIR / "SKILL.md").is_file())
-        self.assertFalse((ROOT / "SKILL.md").exists())
-        for name in ("worker-packet.md", "feedback-loop.md", "setup-preflight.md"):
-            self.assertTrue((SKILL_DIR / "references" / name).is_file())
-            self.assertIn(f"`references/{name}`", SKILL)
-        self.assertFalse((SKILL_DIR / ".github").exists())
+    def test_scalar_metadata_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "mapping"):
+            validator.parse_frontmatter('---\nmetadata: "not a map"\n---\n')
 
-    def test_no_vendor_config_bundle(self):
-        self.assertFalse((ROOT / "platforms").exists())
-        self.assertFalse((ROOT / "docs" / "platforms.md").exists())
-        self.assertNotIn("Host | Project-scoped directory", README)
 
-    def test_runtime_not_promised_by_skill(self):
-        self.assertIn("skill, not a separate model router", README)
-        self.assertIn("actual worker spawning", README.lower())
-        self.assertIn("host", SKILL)
+class PacketTests(unittest.TestCase):
+    def test_templates_are_complete(self):
+        for marker, kind in (("task-template", "task"), ("correction-template", "correction"), ("report-template", "report")):
+            with self.subTest(marker=marker):
+                text = validator.marked_packet(PACKET, marker)
+                self.assertEqual(validator.validate_packet(text, kind, template=True), [])
 
-    def test_publication_ready_readme(self):
-        self.assertIn("npx skills add Tsinwntas/lean-orchestrator --skill lean-orchestrator", README)
-        self.assertIn("skills/lean-orchestrator/", README)
-        for outdated in ("YOUR_GITHUB_USERNAME", "Once this repository is public", "Upgrading from", "When you publish"):
-            self.assertNotIn(outdated, README)
-        self.assertIn("Automatic worker routing", README)
-        self.assertNotIn("benchmarked savings", README)
+    def test_concrete_example_is_valid(self):
+        self.assertEqual(validator.validate_packet(EXAMPLE), [])
 
-    def test_no_external_runtime_requirements(self):
-        self.assertFalse((SKILL_DIR / "scripts").exists())
-        self.assertTrue((ROOT / "scripts" / "validate.py").is_file())
-        self.assertTrue((ROOT / ".github" / "workflows" / "ci.yml").is_file())
+    def test_each_required_task_field_is_enforced(self):
+        fields = validator.parse_packet(EXAMPLE)
+        for key in validator.TASK_KEYS:
+            with self.subTest(key=key):
+                mutated = "\n".join(f"{k}: {v}" for k, v in fields.items() if k != key)
+                # Re-indent multiline values for the text packet format.
+                mutated = re.sub(r"\n(?![A-Z][A-Z /-]*:)([^\n]+)", r"\n  \1", mutated)
+                issues = validator.validate_packet(mutated)
+                self.assertTrue(any(key in issue for issue in issues), issues)
+
+    def test_empty_scope_is_rejected(self):
+        bad = re.sub(r"^WRITE SCOPE:.*$", "WRITE SCOPE:", EXAMPLE, flags=re.M)
+        self.assertTrue(any("WRITE SCOPE" in issue for issue in validator.validate_packet(bad)))
+
+    def test_duplicate_fields_are_rejected(self):
+        self.assertTrue(any("Duplicate" in issue for issue in validator.validate_packet(EXAMPLE + "\nTASK ID: A2")))
+
+    def test_worker_role_cannot_be_head(self):
+        self.assertTrue(any("ROLE" in issue for issue in validator.validate_packet(EXAMPLE.replace("ROLE: WORKER", "ROLE: HEAD"))))
+
+    def test_attempt_number_must_be_positive(self):
+        for number in ("0", "-1", "one", "1.5", "01"):
+            with self.subTest(number=number):
+                issues = validator.validate_packet(EXAMPLE.replace("ROUND: 1", f"ROUND: {number}"))
+                self.assertTrue(any("ROUND" in issue for issue in issues))
+
+    def test_actual_packet_cannot_contain_unfilled_template(self):
+        issues = validator.validate_packet(EXAMPLE.replace("TASK ID: A0", "TASK ID: <assign later>"))
+        self.assertTrue(any("placeholders" in issue for issue in issues))
+
+    def test_report_status_is_not_acceptance(self):
+        report = 'TASK ID: A0\nROUND: 1\nSTATUS: DONE\nBASE: v1\nARTIFACTS: NONE\nCHECKS: NOT RUN; no tool\nSKILLS USED: NONE\nISSUES: validation pending'
+        self.assertEqual(validator.validate_packet(report, "report"), [])
+        issues = validator.validate_packet(report.replace("STATUS: DONE", "STATUS: ACCEPTED"), "report")
+        self.assertTrue(any("STATUS" in issue for issue in issues))
+
+    def test_text_before_fields_is_rejected(self):
+        self.assertTrue(validator.validate_packet("unstructured preface\n" + EXAMPLE))
+
+    def test_missing_and_duplicate_markers_are_rejected(self):
+        for text in ("nothing", PACKET + "\n<!-- packet: task-template -->"):
+            with self.subTest(text=text[:30]), self.assertRaises(ValueError):
+                validator.marked_packet(text, "task-template")
+
+
+class RepositoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "repo"
+        shutil.copytree(ROOT, self.root, ignore=shutil.ignore_patterns("__pycache__", ".git"))
+        self.skill = self.root / "skills/lean-orchestrator"
+
+    def mutate(self, relative: str, old: str, new: str) -> None:
+        path = self.root / relative
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def assertIssue(self, phrase: str) -> None:
+        issues = validator.validate(self.root)
+        self.assertTrue(any(phrase in issue for issue in issues), issues)
+
+    def test_reference_symlink_outside_skill_is_rejected(self):
+        path = self.skill / "references/setup-preflight.md"
+        external = Path(self.temp.name) / "outside.md"
+        external.write_bytes(path.read_bytes())
+        path.unlink()
+        try:
+            path.symlink_to(external)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks are not supported in this environment")
+        self.assertIssue("Skill file escapes installation boundary")
+
+    def test_fork_can_change_install_source_without_changing_validator(self):
+        path = self.root / "README.md"
+        path.write_text(path.read_text().replace(INSTALL_SOURCE, OTHER_SOURCE))
+        self.assertEqual(validator.validate(self.root), [])
+
+    def test_inconsistent_install_sources_are_rejected(self):
+        self.mutate("README.md", INSTALL_SOURCE, OTHER_SOURCE)
+        self.assertIssue("different repositories")
+
+    def test_whole_repository_passes(self):
+        self.assertEqual(validator.validate(self.root), [])
+
+    def test_skill_only_copy_has_no_repository_dependency(self):
+        destination = Path(self.temp.name) / "standalone/lean-orchestrator"
+        shutil.copytree(self.skill, destination)
+        shutil.rmtree(self.root)
+        self.assertEqual(validator.validate_skill(destination), [])
+        self.assertFalse((destination / "scripts").exists())
+        self.assertFalse((destination / ".github").exists())
+
+    def test_skill_only_without_references_fails(self):
+        shutil.rmtree(self.skill / "references")
+        self.assertIssue("Missing skill file")
+
+    def test_missing_each_required_repository_file_fails(self):
+        for relative in validator.REQUIRED:
+            with self.subTest(relative=relative):
+                path = self.root / relative
+                original = path.read_bytes()
+                path.unlink()
+                self.assertIssue("Missing repository file")
+                path.write_bytes(original)
+
+    def test_missing_skill_file_fails(self):
+        (self.skill / "SKILL.md").unlink()
+        self.assertIssue("Missing SKILL.md")
+
+    def test_empty_description_fails(self):
+        path = self.skill / "SKILL.md"
+        path.write_text(re.sub(r"^description:.*$", 'description: ""', path.read_text(), flags=re.M))
+        self.assertIssue("Invalid description")
+
+    def test_oversized_metadata_fails(self):
+        for field, maximum in (("description", 1024), ("compatibility", 500)):
+            with self.subTest(field=field):
+                path = self.skill / "SKILL.md"
+                original = path.read_text()
+                path.write_text(re.sub(rf"^{field}:.*$", f'{field}: "' + "x" * (maximum + 1) + '"', original, flags=re.M))
+                self.assertIssue(f"Invalid {field}")
+                path.write_text(original)
+
+    def test_invalid_name_fails(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", "name: lean-orchestrator", "name: invalid--name")
+        self.assertIssue("Invalid skill name")
+
+    def test_name_must_match_directory(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", "name: lean-orchestrator", "name: different-name")
+        self.assertIssue("directory name")
+
+    def test_missing_version_fails(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", f'  version: "{VERSION}"\n', "")
+        self.assertIssue("metadata.version")
+
+    def test_protocol_mismatch_has_actionable_error(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", '  protocol: "2"', '  protocol: "1"')
+        self.assertIssue("Protocol mismatch")
+
+    def test_old_reference_release_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/references/setup-preflight.md", f"release: {VERSION}", "release: 0.0.0")
+        self.assertIssue("Release mismatch")
+
+    def test_legacy_reference_without_marker_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/references/setup-preflight.md", f"<!-- lean-orchestrator-release: {VERSION} -->", "")
+        self.assertIssue("Release mismatch")
+
+    def test_old_readme_release_is_rejected(self):
+        self.mutate("README.md", f"release: {VERSION}", "release: 0.0.0")
+        self.assertIssue("Release mismatch")
+
+    def test_broken_local_reference_is_rejected(self):
+        self.mutate("README.md", "](LICENSE)", "](MISSING.md)")
+        self.assertIssue("Broken local link")
+
+    def test_link_outside_installable_skill_is_rejected(self):
+        path = self.skill / "SKILL.md"
+        path.write_text(path.read_text() + "\n[not portable](../../README.md)\n")
+        self.assertIssue("escapes installation boundary")
+
+    def test_percent_encoded_escape_is_rejected(self):
+        path = self.skill / "SKILL.md"
+        path.write_text(path.read_text() + "\n[escape](%2e%2e/%2e%2e/README.md)\n")
+        self.assertIssue("escapes installation boundary")
+
+    def test_absolute_and_file_links_are_rejected(self):
+        path = self.skill / "SKILL.md"
+        original = path.read_text()
+        for href in ("/tmp/a.md", "file:///tmp/a.md", "C:/temp/a.md", "//host/share"):
+            with self.subTest(href=href):
+                path.write_text(original + f"\n[bad]({href})\n")
+                self.assertIssue("Nonportable link")
+        path.write_text(original)
+
+    def test_valid_anchor_and_missing_anchor_are_distinguished(self):
+        path = self.skill / "SKILL.md"
+        original = path.read_text()
+        path.write_text(original + "\n[role](#role-gate)\n")
+        self.assertEqual(validator.validate(self.root), [])
+        path.write_text(original + "\n[bad](#missing-anchor)\n")
+        self.assertIssue("Broken anchor")
+
+    def test_duplicate_anchor_is_rejected(self):
+        path = self.skill / "SKILL.md"
+        path.write_text(path.read_text() + '\n<a id="role-gate"></a>\n')
+        self.assertIssue("Duplicate explicit anchor")
+
+    def test_heading_rewording_does_not_break_validation(self):
+        path = self.skill / "SKILL.md"
+        original = path.read_text()
+        changed, count = re.subn(r'(<a id="routing"></a>\n)##[^\n]+', r'\1## An alternative heading', original)
+        self.assertEqual(count, 1)
+        path.write_text(changed)
+        self.assertEqual(validator.validate(self.root), [])
+
+    def test_missing_role_gate_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", '<a id="role-gate"></a>', "")
+        self.assertIssue("protocol section role-gate")
+
+    def test_empty_protocol_section_is_rejected(self):
+        path = self.skill / "SKILL.md"
+        text = re.sub(r'(<a id="budget"></a>).*?(?=<a id="dispatch">)', r'\1\n## Budget\n', path.read_text(), flags=re.S)
+        path.write_text(text)
+        self.assertIssue("Empty protocol section budget")
+
+    def test_unclosed_code_fence_is_rejected(self):
+        path = self.root / "README.md"
+        path.write_text(path.read_text() + "\n```text\nunfinished\n")
+        self.assertIssue("Unclosed code fence")
+
+    def test_missing_skill_license_is_rejected(self):
+        (self.skill / "LICENSE").unlink()
+        self.assertIssue("Missing MIT notice")
+
+    def test_divergent_license_is_rejected(self):
+        path = self.skill / "LICENSE"
+        path.write_text(path.read_text() + "\nA deliberately different notice.\n")
+        self.assertIssue("licenses differ")
+
+    def test_invalid_utf8_is_reported_without_crash(self):
+        (self.skill / "references/worker-packet.md").write_bytes(b"\xff\xfe")
+        self.assertIssue("Cannot read")
+
+    def test_copy_paste_packet_corruption_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/references/worker-packet.md", "WRITE SCOPE:", "WRTE SCOPE:")
+        self.assertIssue("WRITE SCOPE")
+
+    def test_duplicate_root_skill_is_rejected(self):
+        (self.root / "SKILL.md").write_text(SKILL)
+        self.assertIssue("duplicate root SKILL.md")
+
+    def test_public_readme_has_no_owner_setup_placeholder(self):
+        path = self.root / "README.md"
+        path.write_text(path.read_text() + "\nOnce this repository is public\n")
+        self.assertIssue("draft-only wording")
+
+    def test_cli_works_from_an_unrelated_working_directory(self):
+        result = subprocess.run([sys.executable, str(self.root / "scripts/validate.py")], cwd=self.temp.name, text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_cli_has_nonzero_status_for_broken_package(self):
+        (self.skill / "references/setup-preflight.md").unlink()
+        result = subprocess.run([sys.executable, str(self.root / "scripts/validate.py")], text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_cli_supports_standalone_skill_validation(self):
+        result = subprocess.run([sys.executable, str(self.root / "scripts/validate.py"), "--skill-dir", str(self.skill)], text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_workflow_uses_pinned_actions_and_read_only_access(self):
+        workflow = (self.root / ".github/workflows/ci.yml").read_text()
+        pins = re.findall(r"uses:\s+([^\s#]+)", workflow)
+        self.assertEqual(len(pins), 2)
+        self.assertTrue(all(re.fullmatch(r"actions/[a-z-]+@[a-f0-9]{40}", pin) for pin in pins))
+        self.assertRegex(workflow, r"permissions:\s*\n\s+contents: read")
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("timeout-minutes: 5", workflow)
+        self.assertNotIn("pull_request_target", workflow)
+        self.assertNotIn("secrets.", workflow)
 
 
 if __name__ == "__main__":
