@@ -1,4 +1,4 @@
-<!-- lean-orchestrator-release: 1.7.0 -->
+<!-- lean-orchestrator-release: 1.9.0 -->
 # Feedback, acceptance, and recovery
 
 <a id="states"></a>
@@ -7,14 +7,14 @@
 | State | Meaning / exit condition |
 | --- | --- |
 | `PLANNED` | Scope, dependencies, and checks are being settled. |
-| `READY` | Inputs are current, prerequisites accepted and available, route/budget selected. |
+| `READY` | Inputs are current, prerequisites accepted and available, explicit route/budget selected and dispatch gate passed. |
 | `RUNNING` | One identified worker/round owns the assigned write scope. |
 | `REVIEW` | Result collected; no acceptance implied by `DONE`. |
 | `REWORK` | Head prescribed a localized correction within remaining budget. |
 | `ACCEPTED` | Head verified the contract against current, integrated/accessible artifacts. |
 | `STALE` | Relevant prerequisite/input changed; recheck or replan before reuse. |
 | `BLOCKED` | Missing permission, input, safe execution path, or required verification. |
-| `FAILED` | Attempt failed; diagnose and replan/direct-execute or report the gap. |
+| `FAILED` | Attempt failed; diagnose, replan with an eligible worker, or report the gap; no head implementation. |
 | `CANCELLED` | Stop confirmed or workspace isolated from any still-running attempt. |
 
 `REPLAN` is a head decision: change the plan, invalidate affected descendants, preserve useful verified artifacts, and return appropriate tasks to `PLANNED`. `BLOCK` is a decision that sets `BLOCKED`. Never mark a task cancelled just because a cancellation request was sent. Keep an uncertain still-running worker visible in the ledger and protect its write scope.
@@ -22,7 +22,7 @@
 <a id="example"></a>
 ## A0 → A1 → correction
 
-Illustrative task: prepare a simple dataset and a short summary. The head chooses an authorized economical route, specifies the output contract, and assigns a bounded transformation. Worker routing is selected through host controls, not through this text.
+Illustrative task: prepare a simple dataset and a short summary. The head compares smaller eligible model/effort routes first and passes the explicit pre-dispatch gate for the lowest-cost capable route, specifies the output contract, and assigns a bounded transformation. Worker routing is selected through host controls, not through this text.
 
 <!-- packet: example-task -->
 ```text
@@ -59,24 +59,31 @@ The head inspects the actual CSV, confirms the values and row count with a deter
 | Worker returns corrected summary | Head verifies row count 2 and total 7, then accepts A1. |
 | Head checks both final files against the user's request | Deliver artifacts and actual verification. |
 
-The numbers are from this example's literal data, not measured model-performance results. An ordinary D0 tool could complete this tiny task more cheaply; the example illustrates communication, **not a recommendation to delegate trivial work**. In real use, choose packets large enough to justify coordination.
+The numbers are from this example's literal data, not measured model-performance results. A worker can use an ordinary deterministic tool for this tiny transformation. The example illustrates communication, not an efficient task size. In real use, batch related work or reuse an eligible worker; do not use the task's small size as permission for head implementation.
 
 <a id="edge-cases"></a>
 ## Recovery decisions
 
 | Event | Required head action |
 | --- | --- |
-| Host offers cheap per-call routing but no worker role exists | Select the permitted route directly; do not ask the user to create a role first. |
+| Host offers cheap per-call routing but no worker role exists | Select the cheapest capable permitted route directly; do not ask the user to create a role first. |
+| A mid-tier worker is available and has succeeded before | Evaluate smaller eligible routes for this task; familiarity is not a reason to choose the middle tier. |
+| Small worker could plausibly do a reversible, testable task | Give it a bounded useful `TRIAL` before automatically paying for a larger worker. |
+| Small worker cannot meet a concrete requirement or repeatedly fails comparable work | Record the task-specific exclusion or observed failure; escalate one tier at a time without head implementation. |
 | Host confirms a model but exposes only API price, not quota | Keep route confidence and quota-cost uncertainty separate. |
+| Default worker would inherit the head model | Block that dispatch; select/configure an eligible explicit route first. |
+| Head-model worker seems useful for isolation/review | Prior task-scoped user approval is required; isolation alone is not an exception. |
+| Head introduces or discovers a tiny build error | Delegate a focused repair; ownership of the mistake does not authorize head implementation. |
+| Reviewed changes cause an integration conflict | Assign conflict resolution to a worker; the head may only apply reviewed changes unchanged. |
 | Worker sees Lean Orchestrator in its skill catalog | It remains a worker; skill visibility grants no delegation authority. |
-| Mandatory implementation skill is absent | Provide authorized complete requirements or move work to a capable route/head. |
+| Mandatory implementation skill is absent | Provide authorized complete requirements or move work to an eligible capable worker; otherwise block implementation. |
 | Tests pass but artifacts violate the contract | Reject/rework; tests are evidence, not the definition of success. |
-| Worker alters acceptance tests to hide a failure | Reject, preserve evidence, restore only its unauthorized changes safely, replan. |
+| Worker alters acceptance tests to hide a failure | Reject, preserve evidence, assign any necessary safe restoration to a worker, and replan. |
 | Old round completes after a newer result | Quarantine the stale result; do not overwrite accepted work. |
 | Worker times out and cancellation is unconfirmed | Do not hand its write scope to another worker; isolate or block. |
 | A0's accepted output changes while A1 is running | Stop affected work where possible; mark A1 stale and revalidate its inputs/results. |
-| Repeated failure exhausts the finite budget | Diagnose/replan or take over; do not reset attempt counts through renamed tasks. |
-| Head resumes after context loss | Reconcile worker handles, input versions, partial writes, and accepted artifacts before dispatch. |
+| Repeated failure exhausts the finite budget | Diagnose/replan with an eligible worker or block; do not reset attempt counts through renamed tasks. |
+| Head resumes after context loss | Restore role boundaries, route evidence and approvals; reconcile handles, bases, partial writes, and accepted artifacts before dispatch. |
 | Required check cannot run | Record unverified status; use a justified alternative or block acceptance. |
 | User changes goal or cancels | Stop obsolete work, preserve user edits, account for active workers and partial artifacts. |
 

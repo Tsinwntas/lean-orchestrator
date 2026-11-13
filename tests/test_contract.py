@@ -34,9 +34,10 @@ class FrontmatterTests(unittest.TestCase):
     def test_actual_metadata_is_parsed_as_strings_and_mapping(self):
         meta = validator.parse_frontmatter(SKILL)
         self.assertEqual(meta["name"], "lean-orchestrator")
-        self.assertEqual(meta["metadata"]["protocol"], "2")
+        self.assertEqual(meta["metadata"]["protocol"], "4")
+        self.assertEqual(meta["metadata"]["worker-selection"], "cheapest-capable-first")
         self.assertRegex(meta["metadata"]["version"], r"^\d+\.\d+\.\d+$")
-        self.assertEqual(validator.CONTRACT_VERSION, "2")
+        self.assertEqual(validator.CONTRACT_VERSION, "4")
 
     def test_missing_opening_delimiter_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "opening"):
@@ -148,6 +149,150 @@ class PacketTests(unittest.TestCase):
                 validator.marked_packet(text, "task-template")
 
 
+class DispatchRecordTests(unittest.TestCase):
+    """Validate declared decisions, not whether host controls are really applied."""
+
+    def record(self, **changes):
+        fields = {
+            "TASK ID": "A0", "ROUND": "1", "MODEL": "worker-small",
+            "EFFORT": "low", "CANDIDATES": "worker-small@low=FIT; worker-mid@medium=FIT",
+            "CONTROL": "Explicit host model and effort arguments",
+            "ELIGIBILITY": "ECONOMICAL",
+            "EVIDENCE": "Supported lower worker tier; execution requested only; quota unknown",
+            "APPROVAL": "NONE", "LIMITS": "One active attempt; 8 tool calls",
+            "DECISION": "DISPATCH",
+        }
+        fields.update(changes)
+        return "\n".join(f"{k}: {v}" for k, v in fields.items())
+
+    def test_explicit_economical_record_passes(self):
+        self.assertEqual(validator.validate_packet(self.record(), "dispatch"), [])
+
+    def test_dispatch_template_has_every_required_field(self):
+        text = (SKILL_DIR / "references/setup-preflight.md").read_text(encoding="utf-8")
+        self.assertEqual(validator.validate_packet(validator.marked_packet(text, "dispatch-template"), "dispatch", template=True), [])
+
+    def test_every_dispatch_field_is_required(self):
+        for key in validator.DISPATCH_KEYS:
+            with self.subTest(key=key):
+                issues = validator.validate_packet(self.record(**{key: ""}), "dispatch")
+                self.assertTrue(any(key in issue for issue in issues), issues)
+
+    def test_model_inheritance_is_rejected(self):
+        for model in ("inherit", "default", "head", "same as head", "unknown", "auto"):
+            with self.subTest(model=model):
+                issues = validator.validate_packet(self.record(MODEL=model), "dispatch")
+                self.assertTrue(any("MODEL" in issue for issue in issues), issues)
+
+    def test_effort_inheritance_is_rejected(self):
+        for effort in ("inherit", "default", "head", "unknown"):
+            with self.subTest(effort=effort):
+                issues = validator.validate_packet(self.record(EFFORT=effort), "dispatch")
+                self.assertTrue(any("EFFORT" in issue for issue in issues), issues)
+
+    def test_unsupported_effort_control_can_be_disclosed(self):
+        self.assertEqual(validator.validate_packet(self.record(EFFORT="UNSUPPORTED", CANDIDATES="worker-small@UNSUPPORTED=FIT", EVIDENCE="Explicit model selected; host exposes no effort control"), "dispatch"), [])
+
+    def test_head_tier_exception_without_approval_fails(self):
+        for approval in ("NONE", "PENDING", "NOT REQUESTED"):
+            with self.subTest(approval=approval):
+                issues = validator.validate_packet(self.record(ELIGIBILITY="EXCEPTION", APPROVAL=approval), "dispatch")
+                self.assertTrue(any("APPROVAL" in issue for issue in issues), issues)
+
+    def test_scoped_exception_approval_can_be_recorded(self):
+        record = self.record(ELIGIBILITY="EXCEPTION", APPROVAL="User explicitly authorized this model for A0 only")
+        self.assertEqual(validator.validate_packet(record, "dispatch"), [])
+
+    def test_unresolved_route_cannot_dispatch(self):
+        issues = validator.validate_packet(self.record(ELIGIBILITY="UNRESOLVED"), "dispatch")
+        self.assertTrue(any("BLOCK" in issue for issue in issues), issues)
+
+    def test_unavailable_route_can_record_a_block(self):
+        record = self.record(MODEL="UNAVAILABLE", EFFORT="UNAVAILABLE", CANDIDATES="NONE (no enabled worker model)", ELIGIBILITY="UNRESOLVED", DECISION="BLOCK")
+        self.assertEqual(validator.validate_packet(record, "dispatch"), [])
+
+    def test_unknown_decision_is_rejected(self):
+        issues = validator.validate_packet(self.record(DECISION="TRY ANYWAY"), "dispatch")
+        self.assertTrue(any("DECISION" in issue for issue in issues), issues)
+
+    def test_unknown_eligibility_is_rejected(self):
+        issues = validator.validate_packet(self.record(ELIGIBILITY="PROBABLY FINE"), "dispatch")
+        self.assertTrue(any("ELIGIBILITY" in issue for issue in issues), issues)
+
+
+
+class CheapestCapableRoutingTests(unittest.TestCase):
+    """Validates declared cheaper-first choices without claiming to know real cost."""
+
+    def record(self, *, candidate_list="worker-tiny@low=FIT; worker-mid@medium=FIT", model="worker-tiny", effort="low", **changes):
+        fields = {
+            "TASK ID": "A0", "ROUND": "1", "MODEL": model, "EFFORT": effort,
+            "CANDIDATES": candidate_list, "CONTROL": "Explicit host routing",
+            "ELIGIBILITY": "ECONOMICAL", "EVIDENCE": "Documented provisional lower-tier ordering; actual quota unknown",
+            "APPROVAL": "NONE", "LIMITS": "1 attempt, 8 calls", "DECISION": "DISPATCH",
+        }
+        fields.update(changes)
+        return "\n".join(f"{key}: {val}" for key, val in fields.items())
+
+    def test_cheapest_fit_is_selected(self):
+        self.assertEqual(validator.validate_packet(self.record(), "dispatch"), [])
+
+    def test_skipping_cheaper_fit_for_comfort_is_rejected(self):
+        errors = validator.validate_packet(self.record(model="worker-mid", effort="medium"), "dispatch")
+        self.assertTrue(any("first cheapest capable" in error for error in errors), errors)
+
+    def test_cheap_eligible_trial_takes_precedence(self):
+        self.assertEqual(validator.validate_packet(self.record(candidate_list="worker-tiny@low=TRIAL; worker-mid@medium=FIT"), "dispatch"), [])
+        errors = validator.validate_packet(self.record(candidate_list="worker-tiny@low=TRIAL; worker-mid@medium=FIT", model="worker-mid", effort="medium"), "dispatch")
+        self.assertTrue(any("first cheapest capable" in error for error in errors), errors)
+
+    def test_concrete_exclusion_allows_next_qualified_worker(self):
+        sample = self.record(candidate_list="worker-tiny@low=EXCLUDED(required compiler unavailable); worker-mid@medium=FIT", model="worker-mid", effort="medium")
+        self.assertEqual(validator.validate_packet(sample, "dispatch"), [])
+
+    def test_generic_exclusion_is_rejected(self):
+        for why in ("not smart enough", "better quality", "prefer", "just safer"):
+            with self.subTest(why=why):
+                sample = self.record(candidate_list=f"worker-tiny@low=EXCLUDED({why}); worker-mid@medium=FIT", model="worker-mid", effort="medium")
+                self.assertTrue(any("CANDIDATES" in error for error in validator.validate_packet(sample, "dispatch")))
+
+    def test_missing_candidate_list_is_rejected(self):
+        errors = validator.validate_packet(self.record(CANDIDATES=""), "dispatch")
+        self.assertTrue(any("CANDIDATES" in error for error in errors))
+
+    def test_selected_must_appear_in_candidates(self):
+        errors = validator.validate_packet(self.record(model="worker-unknown"), "dispatch")
+        self.assertTrue(any("selected MODEL" in error for error in errors), errors)
+
+    def test_duplicate_model_effort_is_rejected(self):
+        errors = validator.validate_packet(self.record(candidate_list="worker-tiny@low=FIT; worker-tiny@low=FIT"), "dispatch")
+        self.assertTrue(any("repeat" in error for error in errors), errors)
+
+    def test_excluded_candidate_requires_reason(self):
+        errors = validator.validate_packet(self.record(candidate_list="worker-tiny@low=EXCLUDED; worker-mid@medium=FIT", model="worker-mid", effort="medium"), "dispatch")
+        self.assertTrue(any("CANDIDATES" in error for error in errors), errors)
+
+    def test_no_candidate_with_fit_or_trial_blocks_dispatch(self):
+        errors = validator.validate_packet(self.record(candidate_list="worker-tiny@low=EXCLUDED(missing required editor)"), "dispatch")
+        self.assertTrue(any("no FIT or TRIAL" in error for error in errors), errors)
+
+    def test_unknown_candidate_status_is_rejected(self):
+        errors = validator.validate_packet(self.record(candidate_list="worker-tiny@low=MAYBE"), "dispatch")
+        self.assertTrue(any("invalid entry" in error for error in errors), errors)
+
+    def test_user_model_syntax_remains_generic(self):
+        sample = self.record(candidate_list="host/model-v1@low=FIT; local/model-v2@UNSUPPORTED=FIT", model="host/model-v1", effort="low")
+        self.assertEqual(validator.validate_packet(sample, "dispatch"), [])
+
+    def test_selection_policy_required_in_metadata(self):
+        self.assertEqual(validator.POLICY_METADATA["worker-selection"], "cheapest-capable-first")
+
+    def test_task_specific_reason_and_tier_policy_in_core(self):
+        core = (SKILL_DIR / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Mandatory cheapest-first check", core)
+        self.assertIn("no cheaper", (SKILL_DIR / "references/setup-preflight.md").read_text(encoding="utf-8"))
+
+
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -165,6 +310,27 @@ class RepositoryTests(unittest.TestCase):
     def assertIssue(self, phrase: str) -> None:
         issues = validator.validate(self.root)
         self.assertTrue(any(phrase in issue for issue in issues), issues)
+
+    def test_each_role_policy_metadata_value_is_required(self):
+        path = self.skill / "SKILL.md"
+        original = path.read_text(encoding="utf-8")
+        for key, expected in validator.POLICY_METADATA.items():
+            with self.subTest(key=key):
+                path.write_text(original.replace(f'  {key}: "{expected}"\n', ""), encoding="utf-8")
+                self.assertIssue(f"Policy metadata mismatch: {key}")
+        path.write_text(original, encoding="utf-8")
+
+    def test_permissive_head_implementation_metadata_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/SKILL.md", '  head-implementation: "forbidden"', '  head-implementation: "allowed-for-small-tasks"')
+        self.assertIssue("Policy metadata mismatch: head-implementation")
+
+    def test_missing_dispatch_gate_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/references/setup-preflight.md", '<a id="dispatch-gate"></a>', "")
+        self.assertIssue("protocol section dispatch-gate")
+
+    def test_missing_dispatch_approval_field_is_rejected(self):
+        self.mutate("skills/lean-orchestrator/references/setup-preflight.md", "APPROVAL:", "APPROVL:")
+        self.assertIssue("APPROVAL")
 
     def test_reference_symlink_outside_skill_is_rejected(self):
         path = self.skill / "references/setup-preflight.md"
@@ -241,7 +407,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertIssue("metadata.version")
 
     def test_protocol_mismatch_has_actionable_error(self):
-        self.mutate("skills/lean-orchestrator/SKILL.md", '  protocol: "2"', '  protocol: "1"')
+        self.mutate("skills/lean-orchestrator/SKILL.md", '  protocol: "4"', '  protocol: "2"')
         self.assertIssue("Protocol mismatch")
 
     def test_old_reference_release_is_rejected(self):

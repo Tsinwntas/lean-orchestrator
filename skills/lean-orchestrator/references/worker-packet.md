@@ -1,4 +1,4 @@
-<!-- lean-orchestrator-release: 1.7.0 -->
+<!-- lean-orchestrator-release: 1.9.0 -->
 # Worker packets
 
 The head owns the goal and design. Send only the task-specific packet and required implementation guidance. Do not attach the whole orchestration playbook. The following are text protocols, not host API syntax; adapt representation without losing the contract.
@@ -34,7 +34,7 @@ DELIVER: <actual artifact locations/patch and concise result report>
 STOP IF: <ambiguity, stale inputs, conflicting skills, unsafe action, or exhausted limits>
 ```
 
-The head selects and records model routing outside the packet; naming a model in the packet does not configure it. Restrict the worker's tools at the host level where possible. Workers may consult other relevant implementation skills only within scope and permissions. They must not skip a required skill to save context. An excerpt is acceptable only if it preserves every applicable mandatory rule and required linked guidance.
+The head must pass the pre-dispatch gate and record explicit model/effort routing outside the packet; naming a model in the packet does not configure it. Apply the gate again to resumed workers and correction rounds; retained sessions do not waive model restrictions. Restrict the worker's tools at the host level where possible. Workers may consult other relevant implementation skills only within scope and permissions. They must not skip a required skill to save context. An excerpt is acceptable only if it preserves every applicable mandatory rule and required linked guidance.
 
 If the prescribed procedure is impossible, contradictory, or wrong, stop and explain the concrete blocker. Do not blindly follow it or design a replacement architecture. Permit small local repairs only within the specified procedure and budget. Do not change acceptance criteria or suppress errors. Commands that publish, deploy, delete, or modify external systems require their own authorization even when listed as a "check".
 
@@ -56,7 +56,7 @@ VERIFY: <focused check and required result>
 STOP IF: <context unavailable, baseline mismatch, conflict, or exhausted allowance>
 ```
 
-A correction inherits no permissions that the original task lacked. An expanded write scope or changed design requires a head-owned replan and a fresh complete packet. The head's cumulative attempt count does not reset on a new worker, route, or round.
+A correction inherits no permissions that the original task lacked. An expanded write scope or changed design requires a head-owned replan and a fresh complete packet. The head's cumulative attempt count does not reset on a new worker, route, or round. The worker makes every repair, including tiny defects found during head review; the head must not apply a hand-authored repair as an integration shortcut.
 
 <a id="report"></a>
 ## Worker report

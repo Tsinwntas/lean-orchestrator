@@ -14,7 +14,14 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_VERSION = "2"
+CONTRACT_VERSION = "4"
+POLICY_METADATA = {
+    "mode": "orchestrate-only",
+    "head-implementation": "forbidden",
+    "worker-routing": "explicit",
+    "worker-selection": "cheapest-capable-first",
+    "head-tier-workers": "approval-required",
+}
 SKILL_PATH = Path("skills/lean-orchestrator")
 REFERENCES = ("setup-preflight.md", "worker-packet.md", "feedback-loop.md")
 REQUIRED = (
@@ -32,12 +39,16 @@ CORRECTION_KEYS = (
     "ROLE", "TASK ID", "ROUND", "RETAINS", "BASE", "DEFECT", "PROCEDURE",
     "VERIFY", "STOP IF",
 )
+DISPATCH_KEYS = (
+    "TASK ID", "ROUND", "MODEL", "EFFORT", "CANDIDATES", "CONTROL", "ELIGIBILITY",
+    "EVIDENCE", "APPROVAL", "LIMITS", "DECISION",
+)
 REPORT_KEYS = (
     "TASK ID", "ROUND", "STATUS", "BASE", "ARTIFACTS", "CHECKS", "SKILLS USED", "ISSUES",
 )
 ANCHORS = {
     "SKILL.md": ("role-gate", "economy", "routing", "plan", "budget", "dispatch", "review", "finish"),
-    "references/setup-preflight.md": ("discover", "configure", "evidence", "fallback"),
+    "references/setup-preflight.md": ("discover", "rank", "configure", "dispatch-gate", "evidence", "fallback"),
     "references/worker-packet.md": ("task", "correction", "report"),
     "references/feedback-loop.md": ("states", "example", "edge-cases"),
 }
@@ -202,8 +213,53 @@ def parse_packet(text: str) -> dict[str, str]:
     return {key: value.strip() for key, value in result.items()}
 
 
+
+# Dispatch candidates are *declared* evidence, not actual provider costs or model capability.
+# This schema can reject a skipped declared cheaper-capable route, but cannot verify
+# model pricing, availability, routing application, or truthfulness of exclusions.
+_CANDIDATE_RE = re.compile(
+    r"(?P<model>[A-Za-z0-9][A-Za-z0-9._/+:~-]*)@"
+    r"(?P<effort>[A-Za-z0-9][A-Za-z0-9._-]*)="
+    r"(?P<fit>FIT|TRIAL|EXCLUDED(?:\((?P<reason>[^();]+)\))?)$"
+)
+
+
+def check_candidate_ladder(fields: dict[str, str]) -> list[str]:
+    raw = fields.get("CANDIDATES", "").strip()
+    if fields.get("DECISION") != "DISPATCH":
+        return []
+    if not raw:
+        return ["CANDIDATES missing; ranked cheaper-first selection is mandatory"]
+    entries = [part.strip() for part in raw.split(";")]
+    if not all(entries):
+        return ["CANDIDATES contains an empty entry"]
+    parsed = []
+    for entry in entries:
+        match = _CANDIDATE_RE.fullmatch(entry)
+        if not match:
+            return [f"CANDIDATES invalid entry: {entry!r}; expected model@effort=FIT/TRIAL/EXCLUDED(reason)"]
+        model, effort, fit, reason = match.group("model", "effort", "fit", "reason")
+        if fit.startswith("EXCLUDED"):
+            if not reason or len(reason.strip()) < 8:
+                return [f"CANDIDATES excluded route {model!r} needs a concrete task-specific reason"]
+            if re.search(r"(?i)^(?:less capable|not smart enough|too dumb|better quality|prefer|just safer|not sure)$", reason.strip()):
+                return [f"CANDIDATES excluded route {model!r} has a non-specific reason"]
+        parsed.append((model, effort, fit))
+    models = [(m, e) for m, e, _ in parsed]
+    if len(models) != len(set(models)):
+        return ["CANDIDATES must not repeat a model/effort pair"]
+    selected = (fields.get("MODEL", ""), fields.get("EFFORT", ""))
+    if selected not in models:
+        return ["CANDIDATES must include the selected MODEL and EFFORT"]
+    first = next(((m, e) for m, e, fit in parsed if fit in {"FIT", "TRIAL"}), None)
+    if first is None:
+        return ["CANDIDATES has no FIT or TRIAL route for DISPATCH"]
+    if selected != first:
+        return ["CANDIDATES: selected route is not the first cheapest capable FIT/TRIAL candidate"]
+    return []
+
 def validate_packet(text: str, kind: str = "task", *, template: bool = False) -> list[str]:
-    schemas = {"task": TASK_KEYS, "correction": CORRECTION_KEYS, "report": REPORT_KEYS}
+    schemas = {"task": TASK_KEYS, "correction": CORRECTION_KEYS, "report": REPORT_KEYS, "dispatch": DISPATCH_KEYS}
     if kind not in schemas:
         raise ValueError(f"Unknown packet kind: {kind}")
     try:
@@ -222,6 +278,24 @@ def validate_packet(text: str, kind: str = "task", *, template: bool = False) ->
             issues.append("Invalid TASK ID")
         if kind == "report" and fields.get("STATUS") not in {"DONE", "BLOCKED", "FAILED"}:
             issues.append("Invalid worker report STATUS")
+        if kind == "dispatch":
+            decision = fields.get("DECISION")
+            eligibility = fields.get("ELIGIBILITY")
+            if decision not in {"DISPATCH", "BLOCK"}:
+                issues.append("Invalid dispatch DECISION")
+            if eligibility not in {"ECONOMICAL", "EXCEPTION", "UNRESOLVED"}:
+                issues.append("Invalid dispatch ELIGIBILITY")
+            if decision == "DISPATCH":
+                issues.extend(check_candidate_ladder(fields))
+                if eligibility == "UNRESOLVED":
+                    issues.append("Unresolved eligibility must BLOCK dispatch")
+                if eligibility == "EXCEPTION" and fields.get("APPROVAL", "").strip().upper() in {"", "NONE", "PENDING", "NOT REQUESTED"}:
+                    issues.append("Exceptional dispatch requires actual prior APPROVAL")
+                inherited = {"", "inherit", "inherited", "default", "auto", "head", "same as head", "unknown", "unavailable"}
+                if fields.get("MODEL", "").strip().lower() in inherited:
+                    issues.append("Dispatch MODEL must be explicit, not inherited or unknown")
+                if fields.get("EFFORT", "").strip().lower() in inherited:
+                    issues.append("Dispatch EFFORT must be explicit or UNSUPPORTED")
     return issues
 
 
@@ -259,6 +333,9 @@ def validate_skill(skill_dir: Path) -> list[str]:
         issues.append("Missing or invalid metadata.version")
     if not isinstance(metadata, dict) or metadata.get("protocol") != CONTRACT_VERSION:
         issues.append("Protocol mismatch: install matching skill, references, validator, and tests")
+    for key, expected in POLICY_METADATA.items():
+        if not isinstance(metadata, dict) or metadata.get(key) != expected:
+            issues.append(f"Policy metadata mismatch: {key} must be {expected}")
     if len(text.splitlines()) > 500:
         issues.append("SKILL.md exceeds the 500-line context budget")
     license_path = skill_dir / "LICENSE"
@@ -292,6 +369,7 @@ def validate_skill(skill_dir: Path) -> list[str]:
         if text.index('<a id="role-gate"></a>') > text.index('<a id="routing"></a>'):
             issues.append("Role gate must precede routing instructions")
     for filename, markers in (
+        ("setup-preflight.md", (("dispatch-template", "dispatch", True),)),
         ("worker-packet.md", (("task-template", "task", True), ("correction-template", "correction", True), ("report-template", "report", True))),
         ("feedback-loop.md", (("example-task", "task", False),)),
     ):
@@ -362,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         for issue in issues:
             print(f" - {issue}")
         return 1
-    print("Lean Orchestrator validation PASSED: metadata, portability, release, and packet structure")
+    print("Lean Orchestrator validation PASSED: metadata, portability, release, policy, and packet structure")
     print("Static checks only: no live agents or model-usage measurement.")
     return 0
 
